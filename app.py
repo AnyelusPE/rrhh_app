@@ -5,7 +5,7 @@ import io
 
 st.set_page_config(page_title="RRHH - Control de Tardanzas", layout="wide")
 
-st.title("📊 Control de Tardanzas - Montalvo")
+st.title("📊 RRHH - Versión Completa")
 
 # Subir archivos
 file_marc = st.file_uploader("Sube archivo de Marcaciones (Excel)", type=["xlsx", "xls"])
@@ -118,7 +118,7 @@ if st.button("Procesar Datos"):
             df_resultado = pd.DataFrame(resultado)
 
             # --------------------
-            # PIVOT HORIZONTAL
+            # PIVOT HORIZONTAL + TOTAL
             # --------------------
             df_pivot = df_resultado.pivot_table(
                 index=["DNI", "NOMBRE"],
@@ -126,6 +126,11 @@ if st.button("Procesar Datos"):
                 values="TARDANZA (min)",
                 aggfunc="first"
             ).reset_index()
+
+            # Agregar columna con la suma de tardanzas
+            df_pivot["TOTAL_TARDANZA"] = df_pivot.drop(columns=["DNI", "NOMBRE"]).apply(
+                lambda row: sum([x if isinstance(x, (int, float)) else 0 for x in row]), axis=1
+            )
 
             # --------------------
             # MOSTRAR Y DESCARGAR
@@ -145,5 +150,4 @@ if st.button("Procesar Datos"):
             )
 
         except Exception as e:
-
             st.error(f"Error durante el procesamiento: {str(e)}")
