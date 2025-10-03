@@ -5,7 +5,7 @@ import io
 
 st.set_page_config(page_title="RRHH - Control de Tardanzas", layout="wide")
 
-st.title("📊 RRHH - Versión Completa")
+st.title("📊 Control de Tardanzas - Montalvo")
 
 # Subir archivos
 file_marc = st.file_uploader("Sube archivo de Marcaciones (Excel)", type=["xlsx", "xls"])
@@ -145,4 +145,5 @@ if st.button("Procesar Datos"):
             )
 
         except Exception as e:
+
             st.error(f"Error durante el procesamiento: {str(e)}")
