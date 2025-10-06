@@ -1,189 +1,234 @@
-import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
 import io
+import re
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="RRHH - Control de Tardanzas", layout="wide")
+import pandas as pd
+import streamlit as st
 
-st.title("📊 SISTEMA DE MARCACIONES")
 
-# Subir archivos
+st.set_page_config(page_title="RRHH - Control de Tardanzas", page_icon="🕒", layout="wide")
+
+st.title("🕒 Sistema de Marcaciones")
+
+
+@st.cache_data(show_spinner=False)
+def read_excel_bytes(uploaded_file) -> bytes:
+    return uploaded_file.getvalue() if uploaded_file else b""
+
+
+def normaliza_columnas(cols):
+    out = []
+    for c in cols:
+        if isinstance(c, pd.Timestamp):
+            out.append(c.date().strftime("%Y-%m-%d"))
+        else:
+            out.append(str(c).strip().upper())
+    return pd.Index(out)
+
+
+def leer_marcaciones(file) -> pd.DataFrame:
+    data = read_excel_bytes(file)
+    df = pd.read_excel(io.BytesIO(data), dtype=str)
+    df.columns = df.columns.astype(str).str.strip().str.upper()
+
+    renombres = {"NO.": "DNI"}
+    for col in df.columns:
+        if "DEPART" in col:
+            renombres[col] = "DEPARTAMENTO"
+    df.rename(columns=renombres, inplace=True)
+
+    requeridas = ["DEPARTAMENTO", "NOMBRE", "DNI", "FECHA/HORA", "ESTADO"]
+    faltantes = [c for c in requeridas if c not in df.columns]
+    if faltantes:
+        raise ValueError(f"Faltan columnas en marcaciones: {faltantes}. Encontradas: {list(df.columns)}")
+
+    df["FECHA/HORA"] = pd.to_datetime(df["FECHA/HORA"], errors="coerce", dayfirst=True)
+    df = df.dropna(subset=["FECHA/HORA"]).copy()
+    df["FECHA"] = df["FECHA/HORA"].dt.date
+    return df
+
+
+def leer_horarios(file) -> pd.DataFrame:
+    data = read_excel_bytes(file)
+    df = pd.read_excel(io.BytesIO(data), dtype=str)
+    df.columns = normaliza_columnas(df.columns)
+
+    requeridas = ["DNI", "NOMBRE Y APELLIDO", "ID"]
+    faltantes = [c for c in requeridas if c not in df.columns]
+    if faltantes:
+        raise ValueError(f"Faltan columnas en horarios: {faltantes}. Encontradas: {list(df.columns)}")
+
+    columnas_fechas = []
+    for col in df.columns:
+        try:
+            pd.to_datetime(col, dayfirst=True, errors="raise")
+            columnas_fechas.append(col)
+        except Exception:
+            continue
+
+    if not columnas_fechas:
+        raise ValueError("No se detectaron columnas de fecha en el archivo de horarios.")
+
+    df_long = df.melt(
+        id_vars=["DNI", "NOMBRE Y APELLIDO", "ID"],
+        value_vars=columnas_fechas,
+        var_name="FECHA",
+        value_name="HORARIO_ESPERADO",
+    )
+    df_long["FECHA"] = pd.to_datetime(df_long["FECHA"], dayfirst=True, errors="coerce").dt.date
+    df_long["HORARIO_ESPERADO"] = df_long["HORARIO_ESPERADO"].astype(str).str.strip()
+    return df_long
+
+
+def extrae_hora_inicio(horario: str) -> str | None:
+    if not horario or str(horario).strip() == "" or "DESCANSO" in str(horario).upper():
+        return None
+    m = re.search(r"(\d{1,2}:\d{2})", str(horario))
+    return m.group(1) if m else None
+
+
+def horas_a_minutos(hhmm: str | None) -> float | None:
+    if not hhmm:
+        return None
+    try:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
+def calcula_tardanzas(df_marc: pd.DataFrame, df_hor: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # Primera marcación por DNI/FECHA
+    df_first = (
+        df_marc.sort_values("FECHA/HORA")
+        .groupby(["DNI", "FECHA"], as_index=False)["FECHA/HORA"].first()
+        .rename(columns={"FECHA/HORA": "PRIMERA_MARCACION"})
+    )
+    df_first["PRIMERA_MIN"] = df_first["PRIMERA_MARCACION"].dt.hour * 60 + df_first["PRIMERA_MARCACION"].dt.minute
+
+    df_hor = df_hor.copy()
+    df_hor["HORA_INICIO_STR"] = df_hor["HORARIO_ESPERADO"].apply(extrae_hora_inicio)
+    df_hor["HORA_INICIO_MIN"] = df_hor["HORA_INICIO_STR"].apply(horas_a_minutos)
+    df_hor["DESCANSO"] = df_hor["HORA_INICIO_STR"].isna()
+
+    base = df_hor.merge(df_first, on=["DNI", "FECHA"], how="left")
+
+    def tardanza_row(row):
+        if row["DESCANSO"]:
+            return 0
+        if pd.isna(row.get("HORA_INICIO_MIN")):
+            return "-"
+        if pd.isna(row.get("PRIMERA_MIN")):
+            return "-"
+        delta = int(row["PRIMERA_MIN"] - row["HORA_INICIO_MIN"])
+        return max(0, delta)
+
+    base["TARDANZA (min)"] = base.apply(tardanza_row, axis=1)
+    df_resultado = base[[
+        "DNI",
+        "NOMBRE Y APELLIDO",
+        "FECHA",
+        "HORARIO_ESPERADO",
+        "TARDANZA (min)",
+    ]].rename(columns={"NOMBRE Y APELLIDO": "NOMBRE", "HORARIO_ESPERADO": "HORARIO"})
+
+    # Pivot + total
+    df_pivot = df_resultado.pivot_table(
+        index=["DNI", "NOMBRE"],
+        columns="FECHA",
+        values="TARDANZA (min)",
+        aggfunc="first",
+    ).reset_index()
+
+    cols_val = [c for c in df_pivot.columns if c not in ("DNI", "NOMBRE")]
+    def safe_sum(row):
+        s = 0
+        for x in row:
+            if isinstance(x, (int, float)):
+                s += x
+        return s
+    df_pivot["TOTAL_TARDANZA"] = df_pivot[cols_val].apply(safe_sum, axis=1)
+
+    return df_resultado, df_pivot
+
+
+def calcula_horas(df_marc: pd.DataFrame) -> pd.DataFrame:
+    def format_td(td: timedelta) -> str:
+        total_seconds = int(td.total_seconds())
+        if total_seconds < 0:
+            total_seconds = 0
+        h = total_seconds // 3600
+        m = (total_seconds % 3600) // 60
+        s = total_seconds % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    filas = []
+    for (dni, fecha), grupo in df_marc.groupby(["DNI", "FECHA"], sort=True):
+        g = grupo.sort_values("FECHA/HORA").reset_index(drop=True)
+        entrada = g.loc[0, "FECHA/HORA"]
+        salida = g.loc[len(g) - 1, "FECHA/HORA"]
+
+        if len(g) >= 4:
+            inicio_refri = g.loc[1, "FECHA/HORA"]
+            fin_refri = g.loc[2, "FECHA/HORA"]
+            dur_refri = fin_refri - inicio_refri
+        else:
+            inicio_refri = None
+            fin_refri = None
+            dur_refri = timedelta(0)
+
+        horas_trab = salida - entrada - dur_refri
+
+        filas.append({
+            "DNI": dni,
+            "NOMBRE": g.loc[0, "NOMBRE"],
+            "FECHA": fecha,
+            "ENTRADA": entrada.strftime("%H:%M:%S"),
+            "SALIDA": salida.strftime("%H:%M:%S"),
+            "HORAS_TRABAJADAS": format_td(horas_trab),
+            "INICIO_REFRIGERIO": inicio_refri.strftime("%H:%M:%S") if inicio_refri else "-",
+            "FIN_REFRIGERIO": fin_refri.strftime("%H:%M:%S") if fin_refri else "-",
+            "DURACION_REFRIGERIO": format_td(dur_refri),
+        })
+
+    return pd.DataFrame(filas)
+
+
+# Carga de archivos
 file_marc = st.file_uploader("Sube archivo de Marcaciones (Excel)", type=["xlsx", "xls"])
 file_hor = st.file_uploader("Sube archivo de Horarios (Excel)", type=["xlsx", "xls"])
 
 if st.button("Procesar Datos"):
     if not file_marc or not file_hor:
-        st.error("⚠️ Debes subir ambos archivos (marcaciones y horarios).")
+        st.error("Debes subir ambos archivos (marcaciones y horarios).")
     else:
-        with st.spinner("⏳ Procesando cruces de marcaciones y horarios..."):
+        with st.spinner("Procesando cruces de marcaciones y horarios..."):
             try:
-                # --------------------
-                # LEER MARCACIONES
-                # --------------------
-                df_marc = pd.read_excel(file_marc, dtype=str, engine="openpyxl")
-                df_marc.columns = df_marc.columns.astype(str).str.strip().str.upper()
+                df_marc = leer_marcaciones(file_marc)
+                df_hor = leer_horarios(file_hor)
 
-                renombres = {"NO.": "DNI"}
-                for col in df_marc.columns:
-                    if "DEPART" in col:
-                        renombres[col] = "DEPARTAMENTO"
-                df_marc.rename(columns=renombres, inplace=True)
+                df_resultado, df_pivot = calcula_tardanzas(df_marc, df_hor)
+                df_horas = calcula_horas(df_marc)
 
-                columnas_marc_base = ["DEPARTAMENTO", "NOMBRE", "DNI", "FECHA/HORA", "ESTADO"]
-                for col in columnas_marc_base:
-                    if col not in df_marc.columns:
-                        st.error(f"Falta la columna obligatoria en marcaciones: {col}. Encontradas: {list(df_marc.columns)}")
-                        st.stop()
+                st.success("Procesamiento completado correctamente.")
 
-                df_marc["FECHA/HORA"] = pd.to_datetime(df_marc["FECHA/HORA"], errors="coerce", dayfirst=True)
-                df_marc = df_marc.dropna(subset=["FECHA/HORA"])
-                df_marc["FECHA"] = df_marc["FECHA/HORA"].dt.date
-                df_marc["HORA"] = df_marc["FECHA/HORA"].dt.time
-
-                # --------------------
-                # LEER HORARIOS
-                # --------------------
-                df_hor = pd.read_excel(file_hor, dtype=str, engine="openpyxl")
-                df_hor.columns = [c if not isinstance(c, pd.Timestamp) else c.date().strftime("%Y-%m-%d") for c in df_hor.columns]
-                df_hor.columns = pd.Index([str(c).strip().upper() for c in df_hor.columns])
-
-                columnas_hor_base = ["DNI", "NOMBRE Y APELLIDO", "ID"]
-                for col in columnas_hor_base:
-                    if col not in df_hor.columns:
-                        st.error(f"Falta la columna obligatoria en horarios: {col}. Encontradas: {list(df_hor.columns)}")
-                        st.stop()
-
-                # Detectar columnas de fechas
-                columnas_fechas = []
-                for col in df_hor.columns:
-                    try:
-                        fecha = pd.to_datetime(col, dayfirst=True, errors="raise")
-                        columnas_fechas.append(col)
-                    except:
-                        continue
-
-                # --------------------
-                # FORMATO LARGO
-                # --------------------
-                horarios_largos = []
-                for fecha_col in columnas_fechas:
-                    fecha = pd.to_datetime(str(fecha_col), dayfirst=True).date()
-                    temp_df = df_hor[["DNI", "NOMBRE Y APELLIDO", "ID"]].copy()
-                    temp_df["FECHA"] = fecha
-                    temp_df["HORARIO_ESPERADO"] = df_hor[fecha_col].astype(str).str.strip()
-                    horarios_largos.append(temp_df)
-
-                df_hor_largo = pd.concat(horarios_largos, ignore_index=True)
-
-                # --------------------
-                # CRUCE DE TARDANZAS
-                # --------------------
-                resultado = []
-                for _, row in df_hor_largo.iterrows():
-                    dni = str(row["DNI"]).strip()
-                    fecha = row["FECHA"]
-                    horario = str(row["HORARIO_ESPERADO"]).upper()
-
-                    if "DESCANSO" in horario or horario == "" or pd.isna(horario):
-                        tardanza = 0
-                    else:
-                        try:
-                            hora_inicio = horario.split("-")[0].strip()
-                            hora_inicio_dt = datetime.strptime(hora_inicio, "%H:%M").time()
-
-                            registros = df_marc[(df_marc["DNI"] == dni) & (df_marc["FECHA"] == fecha)]
-                            if not registros.empty:
-                                primera_marcacion = registros["FECHA/HORA"].min().time()
-                                delta = (
-                                    datetime.combine(datetime.today(), primera_marcacion)
-                                    - datetime.combine(datetime.today(), hora_inicio_dt)
-                                ).total_seconds() / 60
-                                tardanza = max(0, int(delta))
-                            else:
-                                tardanza = "-"
-                        except:
-                            tardanza = "-"
-
-                    resultado.append({
-                        "DNI": dni,
-                        "NOMBRE": row["NOMBRE Y APELLIDO"],
-                        "FECHA": fecha,
-                        "HORARIO": horario,
-                        "TARDANZA (min)": tardanza,
-                    })
-
-                df_resultado = pd.DataFrame(resultado)
-
-                # --------------------
-                # PIVOT + TOTAL
-                # --------------------
-                df_pivot = df_resultado.pivot_table(
-                    index=["DNI", "NOMBRE"],
-                    columns="FECHA",
-                    values="TARDANZA (min)",
-                    aggfunc="first"
-                ).reset_index()
-
-                df_pivot["TOTAL_TARDANZA"] = df_pivot.drop(columns=["DNI", "NOMBRE"]).apply(
-                    lambda row: sum([x if isinstance(x, (int, float)) else 0 for x in row]), axis=1
-                )
-
-                # --------------------
-                # HORAS TRABAJADAS Y REFRIGERIO
-                # --------------------
-                horas = []
-                for (dni, fecha), grupo in df_marc.groupby(["DNI", "FECHA"]):
-                    grupo_ordenado = grupo.sort_values("FECHA/HORA")
-
-                    entrada = grupo_ordenado["FECHA/HORA"].iloc[0]
-                    salida = grupo_ordenado["FECHA/HORA"].iloc[-1]
-
-                    # Horas intermedias (refrigerio)
-                    if len(grupo_ordenado) >= 4:
-                        inicio_refri = grupo_ordenado["FECHA/HORA"].iloc[1]
-                        fin_refri = grupo_ordenado["FECHA/HORA"].iloc[2]
-                        dur_refri = (fin_refri - inicio_refri)
-                    else:
-                        inicio_refri, fin_refri, dur_refri = None, None, timedelta(0)
-
-                    horas_trab = (salida - entrada - dur_refri)
-
-                    horas.append({
-                        "DNI": dni,
-                        "NOMBRE": grupo_ordenado["NOMBRE"].iloc[0],
-                        "FECHA": fecha,
-                        "ENTRADA": entrada.strftime("%H:%M:%S"),
-                        "SALIDA": salida.strftime("%H:%M:%S"),
-                        "HORAS_TRABAJADAS": str(horas_trab).split(".")[0],
-                        "INICIO_REFRIGERIO": inicio_refri.strftime("%H:%M:%S") if inicio_refri else "-",
-                        "FIN_REFRIGERIO": fin_refri.strftime("%H:%M:%S") if fin_refri else "-",
-                        # 🔧 Corregido: quitar "0 days" del resultado
-                        "DURACIÓN_REFRIGERIO": str(dur_refri).replace("0 days ", "").split(".")[0] if dur_refri != timedelta(0) else "00:00:00",
-                    })
-
-                df_horas = pd.DataFrame(horas)
-
-                # --------------------
-                # DESCARGA
-                # --------------------
-                st.success("✅ Procesamiento completado correctamente.")
-                st.write("### 📅 Resultado de Tardanzas")
+                st.write("### Tardanzas por día")
                 st.dataframe(df_pivot, use_container_width=True)
 
-                st.write("### ⏱️ Resultado de Horas Trabajadas y Refrigerio")
+                st.write("### Horas Trabajadas y Refrigerio")
                 st.dataframe(df_horas, use_container_width=True)
 
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                     df_pivot.to_excel(writer, index=False, sheet_name="Tardanzas")
                     df_horas.to_excel(writer, index=False, sheet_name="Horas_Trabajadas")
+                buffer.seek(0)
 
                 st.download_button(
-                    label="📥 Descargar Resultado en Excel",
+                    label="Descargar resultado en Excel",
                     data=buffer,
                     file_name="reporte_rrhh_completo.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-
             except Exception as e:
-                st.error(f"❌ Error durante el procesamiento: {str(e)}")
+                st.error(f"Error durante el procesamiento: {e}")
